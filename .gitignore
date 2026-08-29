@@ -1,0 +1,33 @@
+# CMake generated files
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+
+# CLion / JetBrains IDE files
+.idea/
+*.iml
+
+# Compiled binaries and intermediate files
+*.exe
+*.dll
+*.dll.a
+*.a
+*.lib
+*.obj
+*.o
+*.pdb
+
+# Local CMake configuration
+CMakeUserPresets.json
+
+# Windows metadata
+Thumbs.db
+Desktop.ini

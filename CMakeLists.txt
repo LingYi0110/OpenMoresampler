@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(moresampler C)
 
 # Use the compiler settings from ciglet's Makefile.
-set(MORESAMPLER_ARCH "32" CACHE STRING "Target architecture (32 or 64)")
+set(MORESAMPLER_ARCH "64" CACHE STRING "Target architecture (32 or 64)")
 set_property(CACHE MORESAMPLER_ARCH PROPERTY STRINGS 32 64)
 
 if(NOT MORESAMPLER_ARCH STREQUAL "32" AND
@@ -235,6 +235,13 @@ target_compile_definitions(moresampler PRIVATE
 target_compile_options(moresampler PRIVATE ${MORESAMPLER_C_FLAGS})
 
 target_link_libraries(moresampler PRIVATE OpenMP::OpenMP_C)
+
+# GCC's OpenMP imported target may expose the compile flag but omit it from
+# the executable link command when using the MinGW toolchain bundled with
+# CLion.  Pass the detected OpenMP flags explicitly so libgomp is linked.
+if(OpenMP_C_FLAGS)
+    target_link_options(moresampler PRIVATE ${OpenMP_C_FLAGS})
+endif()
 
 if(WIN32)
     target_link_libraries(moresampler PRIVATE shlwapi)
