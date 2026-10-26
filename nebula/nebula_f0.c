@@ -5,6 +5,7 @@
 #include "../external/fastapprox/fastexp.h"
 #include "../external/fastapprox/fastlog.h"
 #include "../external/ciglet/ciglet.h"
+#include "nebula_noise.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -300,8 +301,7 @@ nebula_result *nebula_est(
         float th = peak * dither_level;
         for (int i = 0; i < nx; i++) {
             if (th > rms[i]) {
-                float sigma = th - rms[i];
-                x[i] = randn(x[i], sigma * sigma);
+                x[i] = nebula_normal() * (th - rms[i]) + x[i];
             }
         }
         free(rms);
@@ -313,7 +313,7 @@ nebula_result *nebula_est(
 
     int *naxis = (int *)calloc((size_t)Count, sizeof(int));
     for (int j = 0; j < Count; j++)
-        naxis[j] = (int)(j * (thop * 8000.0f));
+        naxis[j] = (int)(j * (thop * 8000.0));
 
     float *fc = (float *)malloc(NEB_NBAND * sizeof(float));
     for (int k = 0; k < NEB_NBAND; k++)
@@ -949,178 +949,4 @@ float *biased_f0_estimation(
 
     free(naxis);
     return f0;
-}
-
-typedef struct neb_sort_pair {
-    float value;
-    int index;
-} neb_sort_pair;
-
-// equal values compare as -1
-static int neb_sort_pair_compare(const void *lhs, const void *rhs)
-{
-    const neb_sort_pair *a = (const neb_sort_pair *)lhs;
-    const neb_sort_pair *b = (const neb_sort_pair *)rhs;
-    return b->value >= a->value ? -1 : 1;
-}
-
-// ascending argsort; caller walks idx backwards for the top-10 frames
-static float *argsort_asc(const float *x, int n, int *idx_out)
-{
-    neb_sort_pair *pairs = (neb_sort_pair *)malloc((size_t)n * sizeof(*pairs));
-    for (int i = 0; i < n; i++) {
-        pairs[i].value = x[i];
-        pairs[i].index = i;
-    }
-    qsort(pairs, (size_t)n, sizeof(*pairs), neb_sort_pair_compare);
-
-    float *sorted = (float *)malloc((size_t)n * sizeof(*sorted));
-    for (int i = 0; i < n; i++) {
-        sorted[i] = pairs[i].value;
-        if (idx_out)
-            idx_out[i] = pairs[i].index;
-    }
-    free(pairs);
-    return sorted;
-}
-
-
-// two-pass F0: coarse nebula_est, then refine
-float *f0_from_wave(
-    float fmin, float fmax,
-    float thop,
-    int use_peak_likelihood,
-    int skip_voicing,
-    float dither_level,
-    float voicing_time_const,
-    float viterbi_sigma,
-    float lmap_smooth,
-    float voicing_mu,
-    float voicing_var,
-    int n_pass, int nhar, int kalman_win,
-    float *x, int nx,
-    int fs,
-    int *out_nfrm)
-{
-    srand(0);
-
-    float fs_f = (float)fs;
-
-    nebula_result *r0 = nebula_est(
-        fmin, fmax,
-        0.03f,
-        use_peak_likelihood, skip_voicing,
-        dither_level, voicing_time_const, viterbi_sigma,
-        lmap_smooth, voicing_mu, voicing_var,
-        n_pass, nhar, kalman_win,
-        x, nx, fs_f);
-
-    int nfrm = r0->nfrm;
-    int width = r0->lmap_width;
-
-    float *row_max = (float *)calloc((size_t)nfrm, sizeof(float));
-    if (nfrm > 0 && r0->lmap_rows) {
-        for (int i = 0; i < nfrm; i++) {
-            float *row = r0->lmap_rows[i];
-            float m = row ? row[0] : 0.0f;
-            for (int j = 1; j < width; j++) {
-                float v = row[j];
-                if (v > m)
-                    m = v;
-            }
-            row_max[i] = m;
-        }
-    }
-
-    int *idx = (int *)malloc((size_t)nfrm * sizeof(int));
-    float *sorted = argsort_asc(row_max, nfrm, idx);
-
-    int ntop = nfrm <= 10 ? nfrm : 10;
-    // overwrite argsort values with the selected f_axis peaks
-    for (int t = 0; t < ntop; t++) {
-        int fi = idx[nfrm - 1 - t];
-        int best_k = 0;
-        float best_v = -100.0f;
-        if (width > 0 && r0->lmap_rows && r0->lmap_rows[fi]) {
-            for (int k = 0; k < width; k++) {
-                float v = r0->lmap_rows[fi][k];
-                if (v > best_v) {
-                    best_v = v;
-                    best_k = k;
-                }
-            }
-        }
-        sorted[t] = r0->f_axis ? r0->f_axis[best_k] : 0.0f;
-    }
-
-    float median = cig_medianfp(sorted, ntop);
-    log_tee_printf("estimate_f0_range: median = %f Hz\n", (double)median);
-
-    free(row_max);
-    free(idx);
-    // argsort value buffer is left allocated
-    nebula_result_free(r0);
-
-    float *xd = (float *)calloc((size_t)nx, sizeof(float));
-    if (nx > 0) {
-        for (int i = 0; i < nx; i++)
-            xd[i] = fabsf(x[i]);
-        float peak = xd[0];
-        for (int i = 1; i < nx; i++)
-            if (xd[i] > peak)
-                peak = xd[i];
-
-        for (int i = 0; i < nx; i++) {
-            float xi = x[i];
-            float sigma = peak * 0.01f;
-            xd[i] = randn(xi, sigma * sigma);
-        }
-    }
-
-    nebula_result *r1 = nebula_est(
-        fmin, fmax,
-        thop,
-        1, skip_voicing,
-        dither_level, voicing_time_const, viterbi_sigma,
-        2.0f, voicing_mu, voicing_var,
-        n_pass, nhar, kalman_win,
-        xd, nx, fs_f);
-
-    *out_nfrm = r1->nfrm;
-    free(xd);
-
-    int all_uv = 1;
-    if (r1->nfrm > 0 && r1->f0) {
-        for (int i = 0; i < r1->nfrm; i++) {
-            if (r1->f0[i] != 0.0f) {
-                all_uv = 0;
-                break;
-            }
-        }
-    } else {
-        all_uv = 1;
-    }
-
-    if (all_uv || r1->nfrm <= 0) {
-        log_tee_printf(
-            "biased_f0_estimation: input is unvoiced; no need for refinement.\n");
-        float *out = (float *)calloc((size_t)r1->nfrm, sizeof(float));
-        nebula_result_free(r1);
-        return out;
-    }
-
-    log_tee_printf("biased_f0_estimation: refining...\n");
-    {
-        float *out = biased_f0_estimation(
-            fmin, fmax, thop,
-            1, skip_voicing,
-            dither_level, voicing_time_const, viterbi_sigma,
-            2.0f, voicing_mu, voicing_var,
-            n_pass, nhar, kalman_win,
-            x, nx, fs_f,
-            r1->f0, r1->nfrm);
-        nebula_result_free(r1);
-        log_tee_printf("biased_f0_estimation: completed.\n");
-        return out;
-    }
 }

@@ -147,6 +147,7 @@ set(MORESAMPLER_SOURCES
     nebula/nebula_model.c
     nebula/nebula_features.c
     nebula/nebula_f0.c
+    nebula/nebula_wave.c
     # llsmsynth
     llsmsynth.c
     # otogen (Lua 5.3 host + HSMM alignment)
