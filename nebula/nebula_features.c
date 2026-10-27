@@ -216,208 +216,179 @@ fftconv_complex(const float *xr, const float *xi, int nx,
     free(plan);
 }
 
-// after first decimation: phase-normalise, second FIR, residual power, pad 256 zeros
-static int x2as_decimated(float *yr, float *yi, int nvalid,
-                          const float aw[4], const float aws[4],
-                          float bandwidth_fc, int decim, float **out)
+// after first decimation: phase-normalise, second FIR, residual power.
+// In-place: the smoothed power envelope is written back into yr.
+// Windows are made by the caller (analysis h, smoothing hs) and shared
+// between both passes.
+static void x2as_decimated(float *yr, float *yi, int nwork,
+                           const float *h, const float *hs, int nh)
 {
-    const int nwork = nvalid + 256;
-    *out = NULL;
-    if (nvalid <= 0 || bandwidth_fc <= 0.0f || decim <= 0)
-        return 0;
-    int nh = (int)ceil(4.0 / (decim * bandwidth_fc));
-    if (nh <= 0)
-        return 0;
-    float omega = decim * bandwidth_fc * (0.5 * M_PI);
-    float *w = make_window(aw, nh, omega);
-    float *ws = make_window(aws, nh, omega);
-    float *y2r = (float *)calloc((size_t)(nwork + nh - 1), sizeof(*y2r));
-    float *y2i = (float *)calloc((size_t)(nwork + nh - 1), sizeof(*y2i));
-    float *power = (float *)calloc((size_t)nwork, sizeof(*power));
-    float *smooth = (float *)calloc((size_t)(nwork + nh - 1), sizeof(*smooth));
-    if (!w || !ws || !y2r || !y2i || !power || !smooth) {
-        free(w); free(ws); free(y2r); free(y2i); free(power); free(smooth);
-        return 0;
-    }
+    int nh2 = nh / 2;
+    float *mag = (float *)malloc((size_t)(4 * nwork));
+    float *y2r, *y2i, *pw;
+    int i;
 
-    for (int i = 0; i < nwork; ++i) {
-        float mag = neb_cabs(yr[i], yi[i]);
-        float den = mag + 1.0e-10f;
-        yr[i] /= den;
-        yi[i] /= den;
+    for (i = 0; i != nwork; ++i)
+        mag[i] = neb_cabs(yr[i], yi[i]);
+    for (i = 0; i != nwork; ++i) {
+        yr[i] = yr[i] / (mag[i] + 1.0e-10);
+        yi[i] = yi[i] / (mag[i] + 1.0e-10);
     }
-    fftconv_complex(yr, yi, nwork, w, nh, y2r, y2i);
-    for (int i = 0; i < nwork; ++i) {
-        int src = i + nh / 2;
-        // second unit-normalize before the phase residual
-        float mag = neb_cabs(y2r[src], y2i[src]);
-        float den = mag + 1.0e-10f;
-        float pr = y2r[src] / den;
-        float pi = y2i[src] / den;
-        float dr = yr[i] - pr;
-        float di = yi[i] - pi;
-        power[i] = dr * dr + di * di;
-    }
-    fftconv_complex(power, NULL, nwork, ws, nh, smooth, NULL);
+    free(mag);
 
-    *out = (float *)malloc((size_t)nvalid * sizeof(**out));
-    if (*out) {
-        for (int i = 0; i < nvalid; ++i)
-            (*out)[i] = smooth[i + nh / 2];
+    y2r = (float *)calloc((size_t)(nh + nwork), sizeof(*y2r));
+    y2i = (float *)calloc((size_t)(nh + nwork), sizeof(*y2i));
+    fftconv_complex(yr, yi, nwork, h, nh, y2r, y2i);
+
+    pw = (float *)malloc((size_t)(4 * nwork));
+    for (i = 0; i != nwork; ++i)
+        pw[i] = neb_cabs(y2r[nh2 + i], y2i[nh2 + i]);
+    for (i = 0; i != nwork; ++i) {
+        float pr = y2r[nh2 + i] / (pw[i] + 1.0e-10);
+        float pi = y2i[nh2 + i] / (pw[i] + 1.0e-10);
+        y2r[nh2 + i] = pr;
+        y2i[nh2 + i] = pi;
+        yr[i] = yr[i] - pr;
+        yi[i] = yi[i] - pi;
+        pw[i] = yr[i] * yr[i] + yi[i] * yi[i];
     }
-    free(w); free(ws); free(y2r); free(y2i); free(power); free(smooth);
-    return *out != NULL;
+    free(y2i);
+
+    fftconv_complex(pw, NULL, nwork, hs, nh, y2r, NULL);
+
+    memcpy(yr, y2r + nh2, (size_t)(4 * nwork));
+    free(y2r);
+    free(pw);
 }
 
-// carrier = heterodyne; bandwidth_fc = window/decimation. SNR2 only changes carrier to 2*fc
-static int extract_band_snr(const float *x, int nx, float carrier,
-                            float bandwidth_fc,
-                            const float aw[4], const float aws[4],
-                            const int *naxis, int nfrm, float *dst)
-{
-    if (!x || !naxis || !dst || nx <= 0 || carrier <= 0.0f ||
-        bandwidth_fc <= 0.0f)
-        return 0;
-    int nw = (int)ceil(4.0 / bandwidth_fc);
-    int decim = (int)floor(0.5 / bandwidth_fc);
-    if (nw <= 0 || decim <= 0)
-        return 0;
-    int ndec = nx / decim;
-    if (ndec <= 0)
-        return 0;
 
-    float *w = make_window(aw, nw, 0.5 * M_PI * bandwidth_fc);
-    float *osc = make_oscillator(nx, (float)(2.0 * M_PI * carrier));
-    float *mix_r = (float *)malloc((size_t)nx * sizeof(*mix_r));
-    float *mix_i = (float *)malloc((size_t)nx * sizeof(*mix_i));
-    float *conv_r = (float *)calloc((size_t)(nx + nw - 1), sizeof(*conv_r));
-    float *conv_i = (float *)calloc((size_t)(nx + nw - 1), sizeof(*conv_i));
-    float *dec_r = (float *)calloc((size_t)(ndec + 256), sizeof(*dec_r));
-    float *dec_i = (float *)calloc((size_t)(ndec + 256), sizeof(*dec_i));
-    if (!w || !osc || !mix_r || !mix_i || !conv_r || !conv_i ||
-        !dec_r || !dec_i) {
-        free(w); free(osc); free(mix_r); free(mix_i);
-        free(conv_r); free(conv_i); free(dec_r); free(dec_i);
-        return 0;
-    }
-
-    for (int i = 0; i < nx; ++i) {
-        mix_r[i] = x[i] * osc[2 * i];
-        mix_i[i] = x[i] * osc[2 * i + 1];
-    }
-    fftconv_complex(mix_r, mix_i, nx, w, nw, conv_r, conv_i);
-    for (int i = 0; i < ndec; ++i) {
-        int src = i * decim + nw / 2;
-        dec_r[i] = conv_r[src];
-        dec_i[i] = conv_i[src];
-    }
-    float *as = NULL;
-    if (!x2as_decimated(dec_r, dec_i, ndec, aw, aws,
-                         bandwidth_fc, decim, &as)) {
-        free(w); free(osc); free(mix_r); free(mix_i);
-        free(conv_r); free(conv_i); free(dec_r); free(dec_i);
-        return 0;
-    }
-    float *axis = (float *)malloc((size_t)ndec * sizeof(*axis));
-    float *query = (float *)malloc((size_t)nfrm * sizeof(*query));
-    if (!axis || !query) {
-        free(axis); free(query); free(as); free(w); free(osc);
-        free(mix_r); free(mix_i); free(conv_r); free(conv_i); free(dec_r); free(dec_i);
-        return 0;
-    }
-    for (int i = 0; i < ndec; ++i)
-        axis[i] = (float)(i * decim);
-    for (int i = 0; i < nfrm; ++i)
-        query[i] = (float)naxis[i];
-    float *interp = cig_interp(axis, as, ndec, query, nfrm);
-    if (interp) {
-        memcpy(dst, interp, (size_t)nfrm * sizeof(*dst));
-        free(interp);
-    }
-
-    free(axis); free(query); free(as); free(w); free(osc);
-    free(mix_r); free(mix_i); free(conv_r); free(conv_i); free(dec_r); free(dec_i);
-    return interp != NULL;
-}
-
-// ciglet IF detector, clamped to [lower, upper]
-static void estimate_if(const float *x, int nx, const int *naxis, int nfrm,
-                        float fc, float fres, float lower, float upper, float *dst)
-{
-    if (!dst)
-        return;
-    ifdetector *ifd = cig_create_ifdetector(fc, fres);
-    if (!ifd)
-        return;
-    for (int t = 0; t < nfrm; ++t) {
-        int nh = ifd->nh;
-        int begin = naxis[t] - nh / 2;
-        float *frame = (float *)malloc((size_t)nh * sizeof(*frame));
-        float value = fc;
-        if (frame) {
-            for (int i = 0; i < nh; ++i) {
-                int src = begin + i;
-                frame[i] = (src >= 0 && src < nx) ? x[src] : 0.0f;
-            }
-            value = cig_ifdetector_estimate(ifd, frame, nh);
-            free(frame);
-        }
-        if (value < lower)
-            value = lower;
-        if (value > upper)
-            value = upper;
-        dst[t] = value;
-    }
-    cig_delete_ifdetector(ifd);
-}
-
-// per-band SNR/IF; SNR2 reuses the fc-sized window with carrier 2*fc
+// per-band SNR/IF worker: heterodyne, decimate, x2as, interpolate, scatter.
+// The SNR2 pass re-runs only the carrier at 2*fc; the three windows, the mix
+// and decimation buffers are shared between both passes.
 void estimate_ifsnr(float *x, int nx, const int *naxis, int nfrm,
-                    const float *fc, const float *fres, int nband, const char *wtype,
-                    const char *stype, float **SNR1, float **IF1,
-                    float **SNR2, float **IF2)
+                    const float *fc, const float *fres, int nband,
+                    const char *wtype, const char *stype,
+                    float **SNR1, float **IF1, float **SNR2, float **IF2)
 {
-    if (!x || !naxis || !fc || !fres || !SNR1 || !IF1 ||
-        nx <= 0 || nfrm <= 0 || nband <= 0)
-        return;
     float aw[4];
     float aws[4];
-    get_wcoef(wtype ? wtype : "nuttall98", aw);
-    get_wcoef(stype ? stype : "hanning", aws);
+    float *query = (float *)calloc((size_t)nfrm, sizeof(*query));
+    for (int t = 0; t < nfrm; ++t)
+        query[t] = (float)naxis[t];
+    get_wcoef(wtype, aw);
+    get_wcoef(stype, aws);
 
 #pragma omp parallel for
     for (int b = 0; b < nband; ++b) {
         float f = fc[b];
+        int decim = (int)floor(0.5 / f);
+        int ndec = nx / decim;
+        float *axis = (float *)calloc((size_t)ndec, sizeof(*axis));
+        for (int i = 0; i < ndec; ++i)
+            axis[i] = (float)(i * decim);
+
+        float carrier = f * 6.283185307179586;
         float bw = fres[b];
-        float *snr1 = (float *)calloc((size_t)nfrm, sizeof(*snr1));
-        float *snr2 = (SNR2 || IF2)
-                          ? (float *)calloc((size_t)nfrm, sizeof(*snr2))
-                          : NULL;
-        if (snr1 && (!SNR2 && !IF2 ? 1 : snr2 != NULL)) {
-            extract_band_snr(x, nx, f, f, aw, aws, naxis, nfrm, snr1);
-            for (int t = 0; t < nfrm; ++t)
-                SNR1[t][b] = snr1[t];
+        int nw = (int)ceil(4.0 / bw);
+        double scaled_bw = decim * (double)bw;
+        int nh = (int)ceil(4.0 / scaled_bw);
+        float omega = scaled_bw * (0.5 * M_PI);
+        float *w = make_window(aw, nw, 0.5 * M_PI * bw);
+        float *wf = make_window(aw, nh, omega);
+        float *ws = make_window(aws, nh, omega);
+        float *mix_r = (float *)calloc((size_t)(nw + nx), sizeof(*mix_r));
+        float *mix_i = (float *)calloc((size_t)(nw + nx), sizeof(*mix_i));
+        float *conv_r, *conv_i;
+        float *dec_r, *dec_i;
+        float *osc = make_oscillator(nx, (float)carrier);
+        int i, t;
 
-            if (SNR2) {
-                extract_band_snr(x, nx, f * 2.0f, f, aw, aws,
-                                 naxis, nfrm, snr2);
-                for (int t = 0; t < nfrm; ++t)
-                    SNR2[t][b] = snr2[t];
+        for (i = 0; i < nx; ++i) {
+            mix_r[i] = osc[2 * i] * x[i];
+            mix_i[i] = x[i] * osc[2 * i + 1];
+        }
+        conv_r = (float *)calloc((size_t)(nw + nx), sizeof(*conv_r));
+        conv_i = (float *)calloc((size_t)(nw + nx), sizeof(*conv_i));
+        fftconv_complex(mix_r, mix_i, nx, w, nw, conv_r, conv_i);
+        if (nx > 0) {
+            memcpy(mix_r, conv_r + nw / 2, (size_t)(4 * nx));
+            memcpy(mix_i, conv_i + nw / 2, (size_t)(4 * nx));
+        }
+        free(conv_r);
+        free(conv_i);
+        free(osc);
+        int nwork = ndec + 256;
+        dec_r = (float *)calloc((size_t)nwork, sizeof(*dec_r));
+        dec_i = (float *)calloc((size_t)nwork, sizeof(*dec_i));
+        for (i = 0; i < ndec; ++i) {
+            dec_r[i] = mix_r[i * decim];
+            dec_i[i] = mix_i[i * decim];
+        }
+        x2as_decimated(dec_r, dec_i, nwork, wf, ws, nh);
+        {
+            float *interp = cig_interp(axis, dec_r, ndec, query, nfrm);
+            for (t = 0; t < nfrm; ++t)
+                SNR1[t][b] = interp[t];
+            free(interp);
+        }
+
+        if (SNR2) {
+            float *osc2 = make_oscillator(nx, (float)(carrier + carrier));
+            for (i = 0; i < nx; ++i) {
+                mix_r[i] = osc2[2 * i] * x[i];
+                mix_i[i] = x[i] * osc2[2 * i + 1];
             }
-
-            estimate_if(x, nx, naxis, nfrm, f, bw, f * 0.5f, f * 1.5f, snr1);
-            for (int t = 0; t < nfrm; ++t)
-                IF1[t][b] = snr1[t];
-
-            if (IF2) {
-                estimate_if(x, nx, naxis, nfrm, f * 2.0f, bw,
-                            f * 1.5f, f * 2.5f, snr2);
-                for (int t = 0; t < nfrm; ++t)
-                    IF2[t][b] = snr2[t];
+            conv_r = (float *)calloc((size_t)(nw + nx), sizeof(*conv_r));
+            conv_i = (float *)calloc((size_t)(nw + nx), sizeof(*conv_i));
+            fftconv_complex(mix_r, mix_i, nx, w, nw, conv_r, conv_i);
+            if (nx > 0) {
+                memcpy(mix_r, conv_r + nw / 2, (size_t)(4 * nx));
+                memcpy(mix_i, conv_i + nw / 2, (size_t)(4 * nx));
+            }
+            free(conv_r);
+            free(conv_i);
+            free(osc2);
+            for (i = 0; i < ndec; ++i) {
+                dec_r[i] = mix_r[i * decim];
+                dec_i[i] = mix_i[i * decim];
+            }
+            x2as_decimated(dec_r, dec_i, nwork, wf, ws, nh);
+            {
+                float *interp = cig_interp(axis, dec_r, ndec, query, nfrm);
+                for (t = 0; t < nfrm; ++t)
+                    SNR2[t][b] = interp[t];
+                free(interp);
             }
         }
-        free(snr1);
-        free(snr2);
+
+        free(w);
+        free(wf);
+        free(ws);
+        free(dec_r);
+        free(dec_i);
+        free(mix_r);
+        free(mix_i);
+        free(axis);
+
+        ifdetector *ifd = cig_create_ifdetector(fc[b], fres[b]);
+        ifdetector *ifd2 = cig_create_ifdetector(fc[b] + fc[b], fres[b]);
+        for (t = 0; t < nfrm; ++t) {
+            int nhif = ifd->nh;
+            float *frame = fetch_frame(x, nx, naxis[t], nhif);
+            double value;
+            value = cig_ifdetector_estimate(ifd, frame, nhif);
+            value = fc[b] * 0.5 < value ? value : fc[b] * 0.5;
+            IF1[t][b] = fc[b] * 1.5 >= value ? value : fc[b] * 1.5;
+            if (IF2) {
+                value = cig_ifdetector_estimate(ifd2, frame, ifd2->nh);
+                value = fc[b] * 1.5 < value ? value : fc[b] * 1.5;
+                IF2[t][b] = fc[b] * 2.5 >= value ? value : fc[b] * 2.5;
+            }
+            free(frame);
+        }
+        cig_delete_ifdetector(ifd);
+        cig_delete_ifdetector(ifd2);
     }
 
+    free(query);
 }
