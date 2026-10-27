@@ -20,7 +20,7 @@
 static inline float neb_fast_mag2db(float x)
 {
     float e = x < 1.0e-10f ? 1.0e-10f : x;
-    return fastlog(e) * 8.685889988860346f;
+    return fastlog(e) * 8.685889988860346;
 }
 
 // F0 estimation: nebula_est, f0_from_wave, biased_f0_estimation
@@ -412,20 +412,19 @@ nebula_result *nebula_est(
     float blockb = viterbi_sigma / (log10(fmax) - log10(fmin)) * (thop * 128.0f);
     float *ptrans = (float *)calloc(NEB_NF0, sizeof(float));
     {
-        float inv_b = 1.0f / blockb;
-        float gauss_n = 0.3989422804014327f * inv_b;
-        float sum = 0.0f;
-        float exp2v = 1.0f;
+        double gauss_n = 0.3989422804014327 / blockb;
+        float sum = 0.0;
+        double exp2v = 1.0;
         for (int i = 0; i < NEB_NF0; i++) {
             float v = exp2v * gauss_n;
             ptrans[i] = v;
             sum += v;
             if (i != NEB_NF0 - 1) {
-                float t = (float)(i + 1);
-                exp2v = exp(t * t * (-0.5f / (blockb * blockb)));
+                double t = i + 1;
+                exp2v = exp(t * t * (-0.5 / (blockb * blockb)));
             }
         }
-        float inv_sum = 1.0f / sum;
+        float inv_sum = 1.0 / sum;
         for (int i = 0; i < NEB_NF0; i++)
             ptrans[i] *= inv_sum;
     }
@@ -837,20 +836,20 @@ float *biased_f0_estimation(
 
         for (int f = 0; f < nf0; f++) {
             for (int h = 0; h < nhar; h++) {
-                float mag = ha[f][h];
-                if (mag < 1.0e-10f)
-                    mag = 1.0e-10f;
-                float hnr_db = 20.0f * log10f(mag);
+                double mag = ha[f][h];
+                if (mag < 1.0e-10)
+                    mag = 1.0e-10;
+                double hnr_db = 20.0 * log10(mag);
                 float conf;
-                if (hnr_db > -70.0f) {
-                    float inner = fastexp(hnr_db * 0.1286f + 6.6856f);
-                    conf = fastexp(-1.755f - 1.0f / (inner + 0.38207f));
+                if (hnr_db > -70.0) {
+                    float inner = fastexp(hnr_db * 0.1286 + 6.6856);
+                    conf = fastexp(-1.755 - 1.0 / (inner + 0.38207));
                 } else {
-                    conf = fastexp(hnr_db * 0.058142f + 0.20593f);
+                    conf = fastexp(hnr_db * 0.058142 + 0.20593);
                 }
-                int untrusted = (conf > 0.1f)
+                int untrusted = (conf > 0.1)
                             || (fabsf(period_out[f][h] - hidx[h])
-                                > 0.3f * bw[h]);
+                                > 0.3 * bw[h]);
                 if (untrusted) {
                     float t = conf * 100.0f;
                     hf[f][h] = t * t;

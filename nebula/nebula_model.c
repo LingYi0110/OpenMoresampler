@@ -111,118 +111,118 @@ neb_gmm *neb_gmm_load_band(int band)
     return g;
 }
 
-// accumulate one band of the conditional GMM onto out_ll
-static void neb_condgmm_accum(
-    const neb_gmm *g,
-    const float feat[5],
-    const float *f_axis,
-    float *out_ll)
+// Conditional GMM log density for one band.
+static float *neb_condgmm_density(const neb_gmm *g, const float *feat,
+                                  const float *axis, int width)
 {
-    float f0_mu[NEB_NMIX];
-    float f0_sigma[NEB_NMIX];
-    float f0_lL[NEB_NMIX];
-    float f0_w[NEB_NMIX];
-    float dx[NEB_NFEAT];
-    float density[NEB_NF0];
-    float lwsum = -1.0e10f;
-    const float v103 = NEB_NFEAT * 1.837877066409345f;
-    float wsum = 0.0f;
+    int nmix = g->nmix;
+    int nfeat = g->nord - 1;
+    float *weights = (float *)calloc((size_t)nmix, sizeof(float));
+    float *means = (float *)calloc((size_t)nmix, sizeof(float));
+    float *sigma = (float *)calloc((size_t)nmix, sizeof(float));
+    float *logw = (float *)calloc((size_t)nmix, sizeof(float));
+    float *y = (float *)calloc((size_t)(2 * g->nord), sizeof(float));
+    double normalizer = nfeat * 1.837877066409345;
+    float maximum = -1.0e10f;
 
-    memset(density, 0, sizeof(density));
-
-    for (int i = 0; i < g->nmix; i++) {
-        float *mu = g->mu[i];
-        float mu0 = mu[NEB_NFEAT];
-        float cs = g->condsigma[i];
-        float y[NEB_NFEAT];
+    for (int i = 0; i < nmix; ++i) {
+        const float *mu = g->mu[i];
+        float mean = mu[nfeat];
+        means[i] = mean;
+        sigma[i] = g->condsigma[i] < 4.0 ? 4.0 : g->condsigma[i];
+        for (int k = 0; k < nfeat; ++k) {
+            y[k] = feat[k] - mu[k];
+            mean += y[k] * g->s21s11i[i][k];
+        }
+        means[i] = mean;
+        cig_lusolve(g->inv11[i], y, nfeat);
         float quad = 0.0f;
-
-        if (cs < 4.0f)
-            cs = 4.0f;
-        f0_sigma[i] = cs;
-
-        for (int k = 0; k < NEB_NFEAT; k++) {
-            dx[k] = feat[k] - mu[k];
-            mu0 += g->s21s11i[i][k] * dx[k];
-        }
-        f0_mu[i] = mu0;
-
-        memcpy(y, dx, sizeof(y));
-        cig_lusolve(g->inv11[i], y, NEB_NFEAT);
-        for (int k = 0; k < NEB_NFEAT; k++)
-            quad += dx[k] * y[k];
-
-        float lw = fastlog(g->w[i]) - v103
-           + (quad + g->det11[i]) * -0.5f;
-        f0_lL[i] = lw;
-        if (lw > lwsum)
-            lwsum = lw;
+        for (int k = 0; k < nfeat; ++k)
+            quad += (feat[k] - mu[k]) * y[k];
+        float value = fastlog(g->w[i]) - normalizer
+                    + (quad + g->det11[i]) * -0.5;
+        logw[i] = value;
+        if (maximum < value)
+            maximum = value;
     }
-
-    for (int i = 0; i < g->nmix; i++) {
-        float lw = f0_lL[i] - lwsum;
-        if (lw < -10.0f)
-            lw = -10.0f;
-        f0_w[i] = fastexp(lw);
-        wsum += f0_w[i];
+    float sum = 0.0f;
+    for (int i = 0; i < nmix; ++i) {
+        float value = logw[i] - maximum;
+        if (value < -10.0)
+            value = -10.0;
+        weights[i] = fastexp(value);
+        sum += weights[i];
     }
-    for (int i = 0; i < g->nmix; i++)
-        f0_w[i] /= wsum;
+    float invsum = 1.0 / sum;
+    for (int i = 0; i < nmix; ++i)
+        weights[i] *= invsum;
 
-    for (int i = 0; i < g->nmix; i++) {
-        if (f0_w[i] < 1.0e-5f)
+    float *density = (float *)calloc((size_t)width, sizeof(float));
+    for (int i = 0; i < nmix; ++i) {
+        if (weights[i] < 1.0e-5)
             continue;
-        float invs = 1.0f / f0_sigma[i];
-        float scale = f0_w[i] / sqrtf(6.283185307179586f * f0_sigma[i]);
-        for (int k = 0; k < NEB_NF0; k++) {
-            float d = f_axis[k] - f0_mu[i];
-            float qq = d * d * invs;
-            if (qq > 50.0f)
-                continue;
-            density[k] += fasterexp(-0.5f * qq) * scale;
+        float scale = weights[i] / sqrt(6.283185307179586 * sigma[i]);
+        float invsigma = 1.0 / sigma[i];
+        for (int k = 0; k < width; ++k) {
+            float d = axis[k] - means[i];
+            float q = d * d * invsigma;
+            float value = q <= 50.0 ? fasterexp(-0.5 * q) : 0.0f;
+            density[k] += value * scale;
         }
     }
-    for (int k = 0; k < NEB_NF0; ++k)
-        out_ll[k] += fastlog(density[k]);
+    for (int k = 0; k < width; ++k)
+        density[k] = fastlog(density[k]);
+    free(weights);
+    free(means);
+    free(sigma);
+    free(logw);
+    free(y);
+    return density;
 }
 
-// per-frame GMM likelihood map, subtract Lcal, log-softmax
-void neb_make_lmap(
-    neb_gmm **bands,
-    float **SNR1, float **SNR2, float **IF1, float **IF2,
-    int nfrm,
-    const float *f_axis,
-    float **mm)
+static void neb_make_lmap_impl(
+    neb_gmm **bands, float **SNR1, float **SNR2, float **IF1, float **IF2,
+    int nfrm, int nband, const float *axis, int width, float **mm)
 {
 #pragma omp parallel for
-    for (int t = 0; t < nfrm; t++) {
-        float acc[NEB_NF0];
-        float invb = 1.0f / NEB_NBAND;
-        float vmax = -1.0e10f;
-        float z = 0.0f;
-
-        memset(acc, 0, sizeof(acc));
-        for (int b = 0; b < NEB_NBAND; b++) {
+    for (int t = 0; t < nfrm; ++t) {
+        float *row = mm[t];
+        memset(row, 0, (size_t)width * sizeof(float));
+        for (int b = 0; b < nband; ++b) {
             float feat[5];
             feat[0] = SNR1[t][b];
             feat[1] = SNR1[t][b <= 6 ? b + 7 : b - 7];
             feat[2] = SNR2[t][b];
-            feat[3] = IF1[t][b] * 8000.0f;
-            feat[4] = 8000.0f * IF2[t][b];
-            neb_condgmm_accum(bands[b], feat, f_axis, acc);
+            feat[3] = IF1[t][b] * 8000.0;
+            feat[4] = 8000.0 * IF2[t][b];
+            float *density = neb_condgmm_density(bands[b], feat, axis, width);
+            for (int k = 0; k < width; ++k)
+                row[k] += density[k];
+            free(density);
         }
-        for (int k = 0; k < NEB_NF0; k++) {
-            float v = invb * acc[k] - NEBULA_LCAL_MEAN[k];
-            mm[t][k] = v;
-            if (v > vmax)
-                vmax = v;
+        float invb = 1.0 / nband;
+        float maximum = -1.0e10f;
+        for (int k = 0; k < width; ++k) {
+            float value = row[k] * invb - NEBULA_LCAL_MEAN[k];
+            row[k] = value;
+            if (maximum < value)
+                maximum = value;
         }
-        for (int k = 0; k < NEB_NF0; k++) {
-            mm[t][k] -= vmax;
-            z += fastexp(mm[t][k]);
+        float sum = 0.0f;
+        for (int k = 0; k < width; ++k) {
+            row[k] -= maximum;
+            sum += fastexp(row[k]);
         }
-        float logz = fastlog(z);
-        for (int k = 0; k < NEB_NF0; k++)
-            mm[t][k] -= logz;
+        float logsum = fastlog(sum);
+        for (int k = 0; k < width; ++k)
+            row[k] -= logsum;
     }
+}
+
+void neb_make_lmap(neb_gmm **bands, float **SNR1, float **SNR2,
+                   float **IF1, float **IF2, int nfrm,
+                   const float *f_axis, float **mm)
+{
+    neb_make_lmap_impl(bands, SNR1, SNR2, IF1, IF2,
+                       nfrm, NEB_NBAND, f_axis, NEB_NF0, mm);
 }
