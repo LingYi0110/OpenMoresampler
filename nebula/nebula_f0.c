@@ -443,7 +443,7 @@ nebula_result *nebula_est(
     vctx.sigma = blockb;
     vctx.ptrans = ptrans;
     int *path = (int *)malloc((size_t)Count * sizeof(int));
-    gvps_full_sampled(path, &vctx, obs, neb_vit_ftran, neb_vit_fntran);
+    gvps_full_sampled_static(path, &vctx, obs, neb_vit_ftran, neb_vit_fntran);
     if (Count > 0) {
         for (int t = 0; t < Count; t++)
             path[t] += i1;
@@ -502,7 +502,7 @@ nebula_result *nebula_est(
                 voice_vit->slice[t]->pair[1].p = post[t];
             }
         }
-        gvps_full_sampled(voice_path, &pchange, voice_vit,
+        gvps_full_sampled_static(voice_path, &pchange, voice_vit,
                           neb_voice_ftran, neb_voice_fntran);
         if (Count > 0) {
             for (int t = 0; t < Count; ++t)
