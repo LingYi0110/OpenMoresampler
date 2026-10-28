@@ -115,6 +115,7 @@ set(MORESAMPLER_SOURCES
     xchg.c
     # resampler
     resampler.c
+    resampler_args.c
     # wavtool
     wavtool.c
     # external: ciglet

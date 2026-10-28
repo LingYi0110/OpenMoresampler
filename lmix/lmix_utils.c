@@ -251,3 +251,15 @@ FP_TYPE *audioread(
     free(mbs);
     return NULL;
 }
+
+/* Pitch-shift frequency grid; keep its log-frequency endpoints typed. */
+FP_TYPE *lmix_pitch_freqwarp(
+    FP_TYPE low, FP_TYPE high, int n, FP_TYPE warp)
+{
+    lmix_warp_bounds bounds = lmix_log_frequency_bounds(low, high, warp);
+    FP_TYPE *freq = (FP_TYPE *)calloc((size_t)n + 1, sizeof(FP_TYPE));
+    for (int i = 0; i <= n; ++i)
+        freq[i] = warp * (exp(((FP_TYPE)i / n *
+            (bounds.high - bounds.low) + bounds.low) / 5000.0) - 1.0);
+    return freq;
+}

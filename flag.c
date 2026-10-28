@@ -56,14 +56,14 @@ void flag_apply(flag_table *dst, flag_table *src, float scale)
 }
 
 // Parse a UTAU flag string and apply recognized flag values.
-float flag_parse(float default_value, flag_table *tbl, const char *str)
+void flag_parse(flag_table *tbl, const char *str)
 {
     if (!str || !tbl)
-        return default_value;
+        return;
 
     signed int len = (signed int)strlen(str);
     if (len <= 0)
-        return default_value;
+        return;
 
     int i = 0;
     while (i < len) {
@@ -78,7 +78,7 @@ float flag_parse(float default_value, flag_table *tbl, const char *str)
         if (c == '_') {
             if (++i >= len) {
                 log_tee_printf("Error: invalid flag sequence '%s'.\n", str);
-                return default_value;
+                return;
             }
             tag[0] = '_';
             tag[1] = str[i];
@@ -86,7 +86,7 @@ float flag_parse(float default_value, flag_table *tbl, const char *str)
         } else if (c == '/') {
             if (++i >= len) {
                 log_tee_printf("Error: invalid flag sequence '%s'.\n", str);
-                return default_value;
+                return;
             }
             // Skip slash form.
             continue;
@@ -109,8 +109,8 @@ float flag_parse(float default_value, flag_table *tbl, const char *str)
                     i++;
                 tag[0] = 'M';
                 tag[1] = 0;
-            } else if (i < len) {
-                // Parse two-letter tags like Mt and Mb.
+            } else if (tag[0] == 'M' && i < len) {
+                // Only the M family has two-letter tags like Mt and Mb.
                 char c2 = str[i];
                 if (c2 != '+' && c2 != '-' &&
                     !((c2 >= '0' && c2 <= '9') || c2 == '.')) {
@@ -178,5 +178,5 @@ float flag_parse(float default_value, flag_table *tbl, const char *str)
             }
         }
     }
-    return default_value;
+    return;
 }

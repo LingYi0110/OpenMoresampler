@@ -46,6 +46,6 @@ flag_table *flag_create(void);
 void flag_apply(flag_table *dst, flag_table *src, float scale);
 
 // Parse a UTAU flag string, including meta flags.
-float flag_parse(float default_value, flag_table *tbl, const char *str);
+void flag_parse(flag_table *tbl, const char *str);
 
 #endif // MORESAMPLER_FLAG_H

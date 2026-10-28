@@ -397,7 +397,7 @@ static FP_TYPE lmix_shift_rd(FP_TYPE rd, FP_TYPE mt)
     FP_TYPE xi1 = lmix_rd_axis[75] + lmix_rd_axis[75] - lmix_rd_axis[74];
     FP_TYPE *tmp = cig_interpu(lmix_rd_axis[0], xi1, (FP_TYPE *)lmix_rd_mapped,
                       76, &rd, 1);
-    FP_TYPE mapped = tmp[0] - 0.01f * mt;
+    FP_TYPE mapped = tmp[0] - 0.01 * mt;
     free(tmp);
     tmp = cig_interp((FP_TYPE *)lmix_rd_mapped, (FP_TYPE *)lmix_rd_axis,
                      76, &mapped, 1);
@@ -600,7 +600,7 @@ static lmix_shift_blob *lmix_shift_spectrum_core(
     int nhar_old = frame->nhar;
     int stride = frame->vt_stride;
     FP_TYPE fhar = (FP_TYPE)nhar_old * f0_old;
-    int nhar_new = (int)rint((double)fhar / (double)f0_new);
+    int nhar_new = (int)ceil((double)fhar / (double)f0_new);
     int nhar_max = nhar_old < nhar_new ? nhar_new : nhar_old;
     int nvt = nhar_max * stride;
     int nnos = frame->noise->nnos;
@@ -919,6 +919,15 @@ static void lmix_grow_harmonics(lmix_frame *frame, int nhar)
         (size_t)nhar * (size_t)frame->vt_stride * sizeof(FP_TYPE));
 }
 
+/* The PE interpolates these phases in the frame loops.  Keep this expression
+ * local rather than introducing the external lerp_phase float-call boundary. */
+static inline FP_TYPE lmix_interp_phase(FP_TYPE a, FP_TYPE b, FP_TYPE t)
+{
+    return (FP_TYPE)atan2(
+        (double)sin_2(b) + ((double)sin_2(a) - sin_2(b)) * t,
+        (double)cos_2(b) + ((double)cos_2(a) - cos_2(b)) * t);
+}
+
 static void lmix_interp_frame(
     lmix_frame *dst, lmix_frame *a, lmix_frame *b, FP_TYPE t)
 {
@@ -936,7 +945,7 @@ static void lmix_interp_frame(
         dst->vt_freq_step = b->vt_freq_step + (a->vt_freq_step - b->vt_freq_step) * t;
         if (nhar_min > 0) {
             for (int i = 0; i < nhar_min; ++i)
-                dst->vs_har_phse[i] = lerp_phase(
+                dst->vs_har_phse[i] = lmix_interp_phase(
                     a->vs_har_phse[i], b->vs_har_phse[i], t);
         }
         if (nhar > nhar_min && nhar_a <= nhar_b) {
@@ -989,16 +998,16 @@ static void lmix_interp_frame(
 
     llsm_nosframe *nd = dst->noise;
     llsm_nosframe *nb = b->noise;
-    llsm_nosframe *na = a->noise;
     if (nd->nnos > 0) {
         for (int i = 0; i < nd->nnos; ++i)
-            nd->spec[i] = nb->spec[i] + (na->spec[i] - nb->spec[i]) * t;
+            nd->spec[i] = nb->spec[i] + (nd->spec[i] - nb->spec[i]) * t;
     }
     if (nd->nchannel > 0) {
         for (int ch = 0; ch < nd->nchannel; ++ch) {
-            llsm_sinframe *ea = na->eenv[ch];
+            /* dst already contains a: blend the right frame b into that copy. */
+            llsm_sinframe *ea = nb->eenv[ch];
             llsm_sinframe *eb = nd->eenv[ch];
-            nd->emin[ch] = na->emin[ch] + (nd->emin[ch] - na->emin[ch]) * t;
+            nd->emin[ch] = nb->emin[ch] + (nd->emin[ch] - nb->emin[ch]) * t;
             int nh = ea->nhar;
             if (eb->nhar < nh)
                 nh = eb->nhar;
@@ -1006,33 +1015,42 @@ static void lmix_interp_frame(
                 continue;
             for (int i = 0; i < nh; ++i) {
                 eb->ampl[i] = ea->ampl[i] + (eb->ampl[i] - ea->ampl[i]) * t;
-                eb->phse[i] = lerp_phase(eb->phse[i], ea->phse[i], t);
+                eb->phse[i] = lmix_interp_phase(eb->phse[i], ea->phse[i], t);
             }
         }
     }
     dst->wave = NULL;
 }
 
-lmix_data *lmix_modify_data(
-    lmix_data *lmix, resampler_args *args,
-    float offset, float stretch_end, float fixed_length, float total_dur,
-    float stretch, float length,
-    int nmap, const void *map_src, const void *map_dst)
+/* Log-frequency endpoints are single-precision model parameters. */
+lmix_warp_bounds lmix_log_frequency_bounds(
+    FP_TYPE low, FP_TYPE high, FP_TYPE warp)
 {
+    lmix_warp_bounds bounds;
+    bounds.low = 5000.0 * log(1.0 + low / warp);
+    bounds.high = 5000.0 * log(1.0 + high / warp);
+    return bounds;
+}
+
+lmix_data *lmix_modify_data(
+    lmix_data *lmix, resampler_args *args, const lmix_time_mapping mapping)
+{
+    // The input timing controls stay immutable; nmap tracks the working map.
+    int nmap = mapping.nmap;
     int fs = g_output_sampling_rate;
     int hop = hop_from_fs(fs);
     FP_TYPE thop_out = (FP_TYPE)hop / (FP_TYPE)fs;
-    int nfrm_out = (int)((double)fs * (double)length / (double)hop);
+    int nfrm_out = (int)((double)fs * (double)mapping.length / (double)hop);
     int nfrm_in = lmix->conf.nfrm;
     int nmap1 = 0;
     FP_TYPE *src_map = NULL;
     FP_TYPE *dst_map = NULL;
 
     if (nmap == 0) {
-        FP_TYPE left = offset + fixed_length;
-        FP_TYPE right = total_dur - stretch_end;
+        FP_TYPE left = mapping.offset + mapping.fixed_length;
+        FP_TYPE right = mapping.total_dur - mapping.stretch_end;
         FP_TYPE leftover = right - left;
-        FP_TYPE stretched = length - stretch;
+        FP_TYPE stretched = mapping.length - mapping.stretch;
         int ext_method;
         if (args->e == 1)
             ext_method = 1;
@@ -1051,12 +1069,12 @@ lmix_data *lmix_modify_data(
         if (ext_method == 1) {
             src_map = (FP_TYPE *)calloc(3, sizeof(FP_TYPE));
             dst_map = (FP_TYPE *)calloc(3, sizeof(FP_TYPE));
-            src_map[0] = offset;
+            src_map[0] = mapping.offset;
             src_map[1] = left;
             src_map[2] = right;
             dst_map[0] = 0.0f;
-            dst_map[1] = stretch;
-            dst_map[2] = length;
+            dst_map[1] = mapping.stretch;
+            dst_map[2] = mapping.length;
             nmap = 3;
             nmap1 = 4;
             src_map = (FP_TYPE *)realloc(src_map, 4 * sizeof(FP_TYPE));
@@ -1066,11 +1084,11 @@ lmix_data *lmix_modify_data(
             int n = nrep + 2;
             src_map = (FP_TYPE *)calloc((size_t)n, sizeof(FP_TYPE));
             dst_map = (FP_TYPE *)calloc((size_t)n, sizeof(FP_TYPE));
-            src_map[0] = offset;
+            src_map[0] = mapping.offset;
             for (int i = 1; i < n; ++i)
                 src_map[i] = (i & 1) ? left : right;
             dst_map[0] = 0.0f;
-            dst_map[1] = stretch;
+            dst_map[1] = mapping.stretch;
             for (int i = 2; i < n; ++i)
                 dst_map[i] = dst_map[i - 1] + leftover;
             nmap = n;
@@ -1086,8 +1104,8 @@ lmix_data *lmix_modify_data(
         src_map = (FP_TYPE *)calloc((size_t)nmap, sizeof(FP_TYPE));
         dst_map = (FP_TYPE *)calloc((size_t)nmap, sizeof(FP_TYPE));
         if (nmap > 0) {
-            memcpy(src_map, map_src, (size_t)nmap * sizeof(FP_TYPE));
-            memcpy(dst_map, map_dst, (size_t)nmap * sizeof(FP_TYPE));
+            memcpy(src_map, mapping.map_src, (size_t)nmap * sizeof(FP_TYPE));
+            memcpy(dst_map, mapping.map_dst, (size_t)nmap * sizeof(FP_TYPE));
         }
         nmap1 = nmap + 1;
         src_map = (FP_TYPE *)realloc(
@@ -1214,7 +1232,7 @@ lmix_data *lmix_modify_data(
 
     FP_TYPE *noise = (FP_TYPE *)calloc((size_t)nfrm_out, sizeof(FP_TYPE));
     for (int i = 0; i < nfrm_out; ++i)
-        noise[i] = randn(0.0f, 1.0f) * args->MP * 0.01f;
+        noise[i] = randn(0.0f, 1.0f) * args->MP * 0.01;
     FP_TYPE *noise_s = cig_moving_avg(noise, nfrm_out, 0.2f / out->conf.thop);
 
     for (int i = 0; i < nfrm_out; ++i) {
@@ -1243,8 +1261,7 @@ lmix_data *lmix_modify_data(
         } else {
             FP_TYPE mix = target + (srcf0 - f0_smooth[i]) * args->modulation *
                 (note_hz * 0.01f) / f0_smooth[i];
-            f0_out[i] = exp_2(
-                log_2(mix) + noise_s[i] * 1.442695040888963407f);
+            f0_out[i] = exp(log(mix) + noise_s[i]);
         }
     }
     free(tmp);
@@ -1258,7 +1275,7 @@ lmix_data *lmix_modify_data(
     free(pb_time);
 
     log_file_printf("modify_lmix_data: shifting pitch  ...\n");
-    FP_TYPE *freqwarp = llsm_warp_freq(
+    FP_TYPE *freqwarp = lmix_pitch_freqwarp(
         0.0f, out->conf.nosf, out->conf.nnos, out->conf.noswarp);
     int *runs = (int *)calloc((size_t)nfrm_out, 2 * sizeof(int));
     int nrun = 0;

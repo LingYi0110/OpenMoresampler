@@ -163,7 +163,7 @@ int load_config(const wchar_t *path, int is_global)
                     if (g_flag_tables[idx] == NULL)
                         g_flag_tables[idx] = flag_create();
                     char *mb = wchar_to_mbs(val);
-                    flag_parse(100000.0f, g_flag_tables[idx], mb);
+                    flag_parse(g_flag_tables[idx], mb);
                     free(mb);
                 }
             }

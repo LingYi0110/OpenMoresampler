@@ -25,4 +25,14 @@ FP_TYPE lerp_phase(FP_TYPE a, FP_TYPE b, FP_TYPE t);
 FP_TYPE *audioread(
     const wchar_t *path, int *fs, int *nbit, int *nsample);
 
+typedef struct lmix_warp_bounds {
+    FP_TYPE low, high;
+} lmix_warp_bounds;
+
+lmix_warp_bounds lmix_log_frequency_bounds(
+    FP_TYPE low, FP_TYPE high, FP_TYPE warp);
+
+FP_TYPE *lmix_pitch_freqwarp(
+    FP_TYPE low, FP_TYPE high, int n, FP_TYPE warp);
+
 #endif /* MORESAMPLER_LMIX_UTILS_H */

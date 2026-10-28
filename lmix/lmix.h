@@ -51,13 +51,17 @@ llsm_layer0 *lmix_to_layer0(lmix_data *lmix);
 xchg_node *lmix_to_xchg(lmix_data *lmix);
 lmix_data *lmix_from_xchg(xchg_node *node);
 
-// nmap/map_src/map_dst are mapping parameters; moresampler currently passes 0, NULL, NULL.
+// By-value timing controls and optional explicit time map.
+// Automatic mapping uses nmap == 0 and NULL map pointers.
 struct resampler_args;
+typedef struct lmix_time_mapping {
+    float offset, stretch_end, fixed_length, total_dur;
+    float stretch, length;
+    int nmap;
+    const void *map_src, *map_dst;
+} lmix_time_mapping;
 lmix_data *lmix_modify_data(
-    lmix_data *lmix, struct resampler_args *args,
-    float offset, float stretch_end, float fixed_length, float total_dur,
-    float stretch, float length,
-    int nmap, const void *map_src, const void *map_dst);
+    lmix_data *lmix, struct resampler_args *args, lmix_time_mapping mapping);
 
 void lmix_unwrap_phase_track(
     FP_TYPE *phase, FP_TYPE *weight, int n, int nbin, int ntran);

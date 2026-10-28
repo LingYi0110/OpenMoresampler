@@ -40,7 +40,7 @@ typedef struct resampler_args {
     float Mb;                   // breathiness     [-100, 100]
     float Md;                   // dryness         [-100, 100]
     float Mm;                   // model interp    [0, 100]
-    int Ms;                     // stabilization   [0, 10] after rint
+    int Ms;                     // stabilization   [0, 10] after round
     float ME;                   // formant emphasis[-100, 100]
     float Mo;                   // openness        [-100, 100]
     float Mr;                   // resonance       [-100, 100]
