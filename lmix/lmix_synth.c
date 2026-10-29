@@ -8,114 +8,85 @@
 
 #include "../config.h"
 #include "../external/ciglet/ciglet.h"
+#include "lmix_lf.h"
 #include "../external/libllsm/envelope.h"
 #include "../logging.h"
 #include "../resampler.h"
-
-// LF spectrum packed params {T0,Te,Tp,Ta,wg,sin,cos,e,A,a,E0}
-typedef struct {
-    FP_TYPE T0;
-    FP_TYPE Te;
-    FP_TYPE Tp;
-    FP_TYPE Ta;
-    FP_TYPE wg;
-    FP_TYPE sin_wgTe;
-    FP_TYPE cos_wgTe;
-    FP_TYPE e;
-    FP_TYPE A;
-    FP_TYPE a;
-    FP_TYPE E0;
-} lmix_lfparam;
 
 // 1 - exp((Te-T0)*x) - Ta*x
 static FP_TYPE lmix_lf_efunc(FP_TYPE x, void *env)
 {
     lmix_lfparam *p = (lmix_lfparam *)env;
-    return 1.0f - exp_3((p->Te - p->T0) * x) - p->Ta * x;
+    return 1.0 - exp_3((p->Te - p->T0) * x) - p->Ta * x;
 }
 
 // (x^2+wg^2)*sin*A + sin*x + wg*exp(-x*Te) - wg*cos
 static FP_TYPE lmix_lf_afunc_cb(FP_TYPE x, void *env)
 {
     lmix_lfparam *p = (lmix_lfparam *)env;
-    return (x * x + p->wg * p->wg) * p->sin_wgTe * p->A +
+    FP_TYPE weighted_sine = p->sin_wgTe * p->A;
+    return (x * x + p->wg * p->wg) * weighted_sine +
            p->sin_wgTe * x +
            p->wg * exp_3(-x * p->Te) -
            p->wg * p->cos_wgTe;
 }
 
-// Brent root finder; volatile float intermediates so 80-bit x87 cannot hang the loop
-static float lmix_lf_brent(FP_TYPE (*func)(FP_TYPE, void *),
-                           float xmin, float xmax, void *env)
-{
-    const float eps = 1e-8f;
-    volatile float a = xmin;
-    volatile float b = xmax;
-    volatile float d = 0.0f;
-    float fa = func(a, env);
-    float fb = func(b, env);
-    int mflag = 1;
-
-    if (fa * fb >= 0.0f)
-        return (a + b) * 0.5f;
-
-    if (fabsf(fa) < fabsf(fb)) {
-        float t = a;
-        a = b;
-        b = t;
-        t = fa;
-        fa = fb;
-        fb = t;
+// Brent root finder for the LF model equations.
+static FP_TYPE lmix_lf_brent(FP_TYPE (*func)(FP_TYPE, void *), FP_TYPE xmin, FP_TYPE xmax, void* env) {
+  const FP_TYPE eps = 1e-8;
+  FP_TYPE a, b, c, s, d = 0.0f;
+  FP_TYPE fa, fb, fc, fs;
+  a = xmin; b = xmax;
+  fa = func(a, env); fb = func(b, env);
+  if(fa * fb >= 0) return (a + b) / 2.0;
+  if(fabs(fa) < fabs(fb)) {
+    c = b; b = a; a = c;
+    fc = fb; fb = fa; fa = fc;
+  } else {
+    c = a;
+    fc = fa;
+  }
+  int mflag = 1;
+  int niter = 0;
+  while(fabs(fb) > eps && fabs(a - b) > eps) {
+    if(fa != fc && fb != fc) {
+      s = a * fb * fc / (fa - fb) / (fa - fc)
+        + b * fa * fc / (fb - fa) / (fb - fc)
+        + c * fa * fb / (fc - fa) / (fc - fb); // Inv. Quad Interpolation
+    } else {
+      s = b - fb * (b - a) / (fb - fa); // Secant
     }
-    volatile float c = a;
-    float fc = fa;
-
-    while (fabsf(fb) > eps && fabsf(a - b) > eps) {
-        volatile float s;
-        if (fa != fc && fb != fc)
-            s = a * fb * fc / (fa - fb) / (fa - fc)
-              + b * fa * fc / (fb - fa) / (fb - fc)
-              + c * fa * fb / (fc - fa) / (fc - fb);
-        else
-            s = b - fb * (b - a) / (fb - fa);
-
-        if ((s < (3.0f * a + b) * 0.25f || s > b) ||
-            (mflag && fabsf(s - b) >= fabsf(b - c) * 0.5f) ||
-            (!mflag && fabsf(s - b) >= fabsf(c - d) * 0.5f) ||
-            (mflag && fabsf(b - c) < eps) ||
-            (!mflag && fabsf(c - d) < eps)) {
-            s = (a + b) * 0.5f;
-            if (s == b || s == a)
-                break;
-            mflag = 1;
-        } else {
-            mflag = 0;
-        }
-
-        float fs = func(s, env);
-        d = c;
-        c = b;
-        fc = fb;
-        if (fa * fs < 0.0f) {
-            b = s;
-            fb = fs;
-        } else {
-            a = s;
-            fa = fs;
-        }
-        if (fabsf(fa) < fabsf(fb)) {
-            float t = b;
-            b = a;
-            a = t;
-            t = fb;
-            fb = fa;
-            fa = t;
-        }
+    if((s < (3.0 * a + b) / 4.0 || s > b) ||
+       (mflag   && fabs(s - b) >= fabs(b - c) * 0.5) ||
+       (! mflag && fabs(s - b) >= fabs(c - d) * 0.5) ||
+       (mflag   && fabs(b - c) < eps) ||
+       (! mflag && fabs(c - d) < eps)) {
+      s = (a + b) / 2.0;
+      if(s == b || s == a) break; // maximum precision reached
+      mflag = 1;
+    } else {
+      mflag = 0;
     }
-    return b;
+    fs = func(s, env);
+    d = c; c = b;
+    fc = fb;
+    if(fa * fs < 0) {
+      b = s;
+      fb = fs;
+    } else {
+      a = s;
+      fa = fs;
+    }
+    if(fabs(fa) < fabs(fb)) {
+      FP_TYPE x = b; b = a; a = x;
+      x = fb; fb = fa; fa = x;
+    }
+    niter ++;
+  }
+  return b;
 }
 
-static lmix_lfparam lmix_lfparam_from_model(lfmodel model)
+lmix_lfparam lmix_lfparam_from_model(lfmodel model)
 {
     lmix_lfparam ret;
     ret.T0 = model.T0;
@@ -129,7 +100,7 @@ static lmix_lfparam lmix_lfparam_from_model(lfmodel model)
 
     FP_TYPE e = lmix_lf_brent(lmix_lf_efunc, 1.0f, 2.0f / (ret.Ta + 1e-9), &ret);
     FP_TYPE e_Te_T0 = exp_3(e * (ret.Te - ret.T0));
-    ret.A = (1.0f - e_Te_T0) / (e * e * ret.Ta) +
+    ret.A = (1.0 - e_Te_T0) / (e * e * ret.Ta) +
             (ret.Te - ret.T0) * e_Te_T0 / (e * ret.Ta);
     ret.e = e;
 
@@ -137,54 +108,6 @@ static lmix_lfparam lmix_lfparam_from_model(lfmodel model)
 
     ret.E0 = -model.Ee / (exp_3(ret.a * ret.Te) * ret.sin_wgTe);
     return ret;
-}
-
-static FP_TYPE *lmix_lfmodel_spectrum(
-    lfmodel model, FP_TYPE *freq, int nf, FP_TYPE *dst_phase)
-{
-    lmix_lfparam p = lmix_lfparam_from_model(model);
-    FP_TYPE e = p.e;
-    FP_TYPE a = p.a;
-    FP_TYPE wg = p.wg;
-    FP_TYPE E0 = p.E0;
-    FP_TYPE sin_wgTe = p.sin_wgTe;
-    FP_TYPE cos_wgTe = p.cos_wgTe;
-    FP_TYPE Te = p.Te;
-    FP_TYPE Ta = p.Ta;
-    FP_TYPE T0 = p.T0;
-    FP_TYPE e1eTa = e * (1.0f - e * Ta);
-    FP_TYPE *dst_magn = (FP_TYPE *)calloc((size_t)nf, sizeof(FP_TYPE));
-    for (int i = 0; i < nf; ++i) {
-        FP_TYPE Omega = (FP_TYPE)(2.0 * M_PI) * freq[i];
-        cplx asubipif = c_cplx(a, -Omega);
-        cplx P1 = c_div(c_cplx(E0, 0.0f),
-                        c_add(c_mul(asubipif, asubipif), c_cplx(wg * wg, 0.0f)));
-        cplx P2 = c_add(c_cplx(wg, 0.0f),
-            c_mul(c_exp_2(c_mul(asubipif, c_cplx(Te, 0.0f))),
-                  c_sub(c_mul(asubipif, c_cplx(sin_wgTe, 0.0f)),
-                        c_cplx(wg * cos_wgTe, 0.0f))));
-        cplx P3 = c_mul(c_cplx(model.Ee, 0.0f), c_div(
-            c_exp_2(c_cplx(0.0f, -Omega * Te)),
-            c_mul(c_cplx(0.0f, e * Ta * Omega), c_cplx(e, Omega))));
-        cplx P4;
-        if (e1eTa < 1.0f)
-            P4 = c_cplx(0.0f, -e * Ta * Omega);
-        else
-            P4 = c_sub(
-                c_mul(c_cplx(e1eTa, 0.0f),
-                      c_sub(c_cplx(1.0f, 0.0f),
-                            c_exp_2(c_cplx(0.0f, -Omega * (T0 - Te))))),
-                c_cplx(0.0f, e * Ta * Omega));
-        cplx G = c_add(c_mul(P1, P2), c_mul(P3, P4));
-        dst_magn[i] = c_abs(G);
-        if (dst_magn[i] != dst_magn[i]) {
-            dst_magn[i] = 0.0f;
-            G = c_cplx(0.0f, 0.0f);
-        }
-        if (dst_phase != NULL)
-            dst_phase[i] = c_arg(G);
-    }
-    return dst_magn;
 }
 
 // LF * lip radiation * last-band vt_magn; optional minphase into phse_out
@@ -386,7 +309,7 @@ static FP_TYPE lmix_loudness_weight(FP_TYPE freq)
 {
     FP_TYPE f = freq < 300.0f ? 300.0f : freq;
     FP_TYPE f2 = f * f;
-    FP_TYPE h = f2 * f2 * f2 * (f2 + 1440000.0f)
+    FP_TYPE h = f2 * f2 * (f2 + 1440000.0f)
         / ((f2 + 160000.0f) * (f2 + 160000.0f) * (f2 + 9610000.0f));
     return (FP_TYPE)pow((double)h, 0.33);
 }
@@ -435,13 +358,13 @@ static FP_TYPE *lmix_vt_to_faxis(
 
     FP_TYPE *kernel = (FP_TYPE *)calloc(41, sizeof(FP_TYPE));
     for (int i = 0; i < 41; ++i)
-        kernel[i] = 0.54f - 0.46f * cos_2((FP_TYPE)i * (FP_TYPE)M_PI / 20.0f);
+        kernel[i] = 0.54 - 0.46 * cos_2(i * M_PI / 20.0);
     for (int i = -20; i < 0; ++i) {
-        FP_TYPE x = (FP_TYPE)i * (FP_TYPE)M_PI / 4.0f;
+        FP_TYPE x = i * M_PI / 4.0;
         kernel[i + 20] *= sin_2(x) / x;
     }
     for (int i = 1; i < 20; ++i) {
-        FP_TYPE x = (FP_TYPE)i * (FP_TYPE)M_PI / 4.0f;
+        FP_TYPE x = i * M_PI / 4.0;
         kernel[i + 20] *= sin_2(x) / x;
     }
 
@@ -477,7 +400,7 @@ static FP_TYPE *lmix_vt_to_faxis(
         if (faxis[i] >= fhar)
             fade = 0.0f;
         else if (faxis[i] >= fhar - 1000.0f)
-            fade = (fhar - faxis[i]) * 0.000690779983997345f;
+            fade = (fhar - faxis[i]) * 0.000690779983997345;
         else
             fade = fade0;
         FP_TYPE floorv = direct[i] + fade;
@@ -745,7 +668,7 @@ static lmix_shift_blob *lmix_shift_spectrum_core(
     }
 
     {
-        FP_TYPE dens = log_2(f0_old / f0_new);
+        FP_TYPE dens = log(f0_old / f0_new);
 
         for (int i = 0; i < nbin; ++i)
             warped[i] += dens;
@@ -810,7 +733,7 @@ static lmix_shift_blob *lmix_shift_spectrum_core(
             gain = 2.0f;
         if (gain < 0.5f)
             gain = 0.5f;
-        FP_TYPE gain_log = (anchor != NULL) ? anchor->loud : log_2(gain);
+        FP_TYPE gain_log = (anchor != NULL) ? anchor->loud : log(gain);
         blob->loud = gain_log;
         for (int i = 0; i < nbin; ++i)
             warped[i] += gain_log;
@@ -832,7 +755,7 @@ static lmix_shift_blob *lmix_shift_spectrum_core(
     if (anchor != NULL)
         blob->energy = anchor->energy;
     else
-        blob->energy = log_2(energy_new / energy_old) * 0.5f;
+        blob->energy = log(energy_new / energy_old) * 0.5f;
 
     {
         FP_TYPE mb = args->Mb;
@@ -841,7 +764,7 @@ static lmix_shift_blob *lmix_shift_spectrum_core(
             scale = (mb + 100.0f) * 0.008f + 0.2000000001f;
         else
             scale = 0.01f * mb + 1.0000000001f;
-        FP_TYPE add = blob->energy + log_2(scale);
+        FP_TYPE add = blob->energy + log(scale);
         if (nnos > 0) {
             for (int i = 0; i < nnos; ++i)
                 frame->noise->spec[i] += add;

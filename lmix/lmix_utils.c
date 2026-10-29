@@ -10,6 +10,7 @@
 #include <../external/libaiff/libaiff/libaiff.h>
 
 #include "external/ciglet/ciglet.h"
+#include "lmix_lf.h"
 #include "../utils.h"
 
 int sign_change_span(FP_TYPE *x, int n, int i)
@@ -262,4 +263,51 @@ FP_TYPE *lmix_pitch_freqwarp(
         freq[i] = warp * (exp(((FP_TYPE)i / n *
             (bounds.high - bounds.low) + bounds.low) / 5000.0) - 1.0);
     return freq;
+}
+
+FP_TYPE *lmix_lfmodel_spectrum(
+    lfmodel model, FP_TYPE *freq, int nf, FP_TYPE *dst_phase)
+{
+    lmix_lfparam p = lmix_lfparam_from_model(model);
+    FP_TYPE e = p.e;
+    FP_TYPE a = p.a;
+    FP_TYPE wg = p.wg;
+    FP_TYPE E0 = p.E0;
+    FP_TYPE sin_wgTe = p.sin_wgTe;
+    FP_TYPE cos_wgTe = p.cos_wgTe;
+    FP_TYPE Te = p.Te;
+    FP_TYPE Ta = p.Ta;
+    FP_TYPE T0 = p.T0;
+    FP_TYPE *dst_magn = (FP_TYPE *)calloc((size_t)nf, sizeof(FP_TYPE));
+    FP_TYPE e1eTa = e * (1.0 - e * Ta);
+    double tail_phase_scale = -2.0 * M_PI * (T0 - Te);
+    double te_phase_scale = -2.0 * M_PI * Te;
+    double eTa_omega_scale = 2.0 * M_PI * (e * Ta);
+    for (int i = 0; i < nf; ++i) {
+        double Omega = 2.0 * M_PI * freq[i];
+        cplx asubipif = c_cplx(a, -Omega);
+        cplx P1 = c_div(c_cplx(E0, 0.0f),
+                        c_add(c_mul(asubipif, asubipif), c_cplx(wg * wg, 0.0f)));
+        cplx P2 = c_add(c_cplx(wg, 0.0f),
+            c_mul(c_exp_2(c_mul(asubipif, c_cplx(Te, 0.0f))),
+                  c_sub(c_mul(asubipif, c_cplx(sin_wgTe, 0.0f)),
+                        c_cplx(wg * cos_wgTe, 0.0f))));
+        cplx P3 = c_mul(c_cplx(model.Ee, 0.0f), c_div(
+            c_exp_2(c_cplx(0.0f, te_phase_scale * freq[i])),
+            c_mul(c_cplx(0.0f, eTa_omega_scale * freq[i]), c_cplx(e, Omega))));
+        cplx P4 = c_sub(
+            c_mul(c_cplx(e1eTa, 0.0f),
+                  c_sub(c_cplx(1.0f, 0.0f),
+                        c_exp_2(c_cplx(0.0f, tail_phase_scale * freq[i])))),
+            c_cplx(0.0f, eTa_omega_scale * freq[i]));
+        cplx G = c_add(c_mul(P1, P2), c_mul(P3, P4));
+        dst_magn[i] = c_abs(G);
+        if (isnan(dst_magn[i])) {
+            dst_magn[i] = 0.0f;
+            G = c_cplx(0.0f, 0.0f);
+        }
+        if (dst_phase != NULL)
+            dst_phase[i] = c_arg(G);
+    }
+    return dst_magn;
 }
