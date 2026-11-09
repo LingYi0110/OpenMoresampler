@@ -265,6 +265,103 @@ FP_TYPE *lmix_pitch_freqwarp(
     return freq;
 }
 
+// 1 - exp((Te-T0)*x) - Ta*x
+static FP_TYPE lmix_lf_efunc(FP_TYPE x, void *env)
+{
+    lmix_lfparam *p = (lmix_lfparam *)env;
+    return 1.0 - exp_3((p->Te - p->T0) * x) - p->Ta * x;
+}
+
+// (x^2+wg^2)*sin*A + sin*x + wg*exp(-x*Te) - wg*cos
+static FP_TYPE lmix_lf_afunc_cb(FP_TYPE x, void *env)
+{
+    lmix_lfparam *p = (lmix_lfparam *)env;
+    double polynomial = (x * x + p->wg * p->wg) * p->sin_wgTe * p->A;
+    return polynomial + p->sin_wgTe * x +
+           p->wg * exp_3(-x * p->Te) -
+           p->wg * p->cos_wgTe;
+}
+
+// Brent root finder for the LF model equations.
+static FP_TYPE lmix_lf_brent(FP_TYPE (*func)(FP_TYPE, void *), FP_TYPE xmin, FP_TYPE xmax, void* env) {
+  const FP_TYPE eps = 1e-8;
+  FP_TYPE a, b, c, s, d = 0.0f;
+  FP_TYPE fa, fb, fc, fs;
+  a = xmin; b = xmax;
+  fa = func(a, env); fb = func(b, env);
+  if(fa * fb >= 0) return (a + b) / 2.0;
+  if(fabs(fa) < fabs(fb)) {
+    c = b; b = a; a = c;
+    fc = fb; fb = fa; fa = fc;
+  } else {
+    c = a;
+    fc = fa;
+  }
+  int mflag = 1;
+  int niter = 0;
+  while(fabs(fb) > eps && fabs(a - b) > eps) {
+    if(fa != fc && fb != fc) {
+      s = a * fb * fc / (fa - fb) / (fa - fc)
+        + b * fa * fc / (fb - fa) / (fb - fc)
+        + c * fa * fb / (fc - fa) / (fc - fb); // Inv. Quad Interpolation
+    } else {
+      s = b - fb * (b - a) / (fb - fa); // Secant
+    }
+    if((s < (3.0 * a + b) / 4.0 || s > b) ||
+       (mflag   && fabs(s - b) >= fabs(b - c) * 0.5) ||
+       (! mflag && fabs(s - b) >= fabs(c - d) * 0.5) ||
+       (mflag   && fabs(b - c) < eps) ||
+       (! mflag && fabs(c - d) < eps)) {
+      s = (a + b) / 2.0;
+      if(s == b || s == a) break; // maximum precision reached
+      mflag = 1;
+    } else {
+      mflag = 0;
+    }
+    fs = func(s, env);
+    d = c; c = b;
+    fc = fb;
+    if(fa * fs < 0) {
+      b = s;
+      fb = fs;
+    } else {
+      a = s;
+      fa = fs;
+    }
+    if(fabs(fa) < fabs(fb)) {
+      FP_TYPE x = b; b = a; a = x;
+      x = fb; fb = fa; fa = x;
+    }
+    niter ++;
+  }
+  return b;
+}
+
+static lmix_lfparam lmix_lfparam_from_model(lfmodel model)
+{
+    lmix_lfparam ret;
+    ret.T0 = model.T0;
+    ret.Te = model.T0 * model.te;
+    ret.Tp = model.T0 * model.tp;
+    ret.Ta = model.T0 * model.ta;
+    ret.a = 0.0f;
+    ret.wg = M_PI / ret.Tp;
+    ret.sin_wgTe = sin_3(ret.wg * ret.Te);
+    ret.cos_wgTe = cos_3(ret.wg * ret.Te);
+
+    FP_TYPE e = lmix_lf_brent(lmix_lf_efunc, 1.0f, 2.0f / (ret.Ta + 1e-9), &ret);
+    FP_TYPE e_Te_T0 = exp_3(e * (ret.Te - ret.T0));
+    ret.A = (1.0 - e_Te_T0) / (e * e * ret.Ta) +
+            (ret.Te - ret.T0) * e_Te_T0 / (e * ret.Ta);
+    ret.e = e;
+
+    ret.a = lmix_lf_brent(lmix_lf_afunc_cb, 0.0f, 1.0e9f, &ret);
+
+    ret.E0 = -model.Ee / (exp_3(ret.a * ret.Te) * ret.sin_wgTe);
+    return ret;
+}
+
+
 FP_TYPE *lmix_lfmodel_spectrum(
     lfmodel model, FP_TYPE *freq, int nf, FP_TYPE *dst_phase)
 {
@@ -279,22 +376,28 @@ FP_TYPE *lmix_lfmodel_spectrum(
     FP_TYPE Ta = p.Ta;
     FP_TYPE T0 = p.T0;
     FP_TYPE *dst_magn = (FP_TYPE *)calloc((size_t)nf, sizeof(FP_TYPE));
-    FP_TYPE e1eTa = e * (1.0 - e * Ta);
-    double tail_phase_scale = -2.0 * M_PI * (T0 - Te);
+    if (nf <= 0)
+        return dst_magn;
     double te_phase_scale = -2.0 * M_PI * Te;
     double eTa_omega_scale = 2.0 * M_PI * (e * Ta);
+    FP_TYPE Ee = model.Ee;
+    FP_TYPE e1eTa = e * (1.0 - e * Ta);
+    FP_TYPE p2_coefficient = a * sin_wgTe - wg * cos_wgTe;
+    FP_TYPE p1_den_constant = a * a + wg * wg;
+    FP_TYPE twice_a = a + a;
+    double tail_phase_scale = -2.0 * M_PI * (T0 - Te);
     for (int i = 0; i < nf; ++i) {
-        double Omega = 2.0 * M_PI * freq[i];
-        cplx asubipif = c_cplx(a, -Omega);
+        double negOmega = -2.0 * M_PI * freq[i];
+        cplx asubipif = c_cplx(a, negOmega);
         cplx P1 = c_div(c_cplx(E0, 0.0f),
-                        c_add(c_mul(asubipif, asubipif), c_cplx(wg * wg, 0.0f)));
+                        c_cplx(p1_den_constant - asubipif.imag * asubipif.imag,
+                               twice_a * asubipif.imag));
         cplx P2 = c_add(c_cplx(wg, 0.0f),
             c_mul(c_exp_2(c_mul(asubipif, c_cplx(Te, 0.0f))),
-                  c_sub(c_mul(asubipif, c_cplx(sin_wgTe, 0.0f)),
-                        c_cplx(wg * cos_wgTe, 0.0f))));
-        cplx P3 = c_mul(c_cplx(model.Ee, 0.0f), c_div(
+                  c_cplx(p2_coefficient, asubipif.imag * sin_wgTe)));
+        cplx P3 = c_mul(c_cplx(Ee, 0.0f), c_div(
             c_exp_2(c_cplx(0.0f, te_phase_scale * freq[i])),
-            c_mul(c_cplx(0.0f, eTa_omega_scale * freq[i]), c_cplx(e, Omega))));
+            c_mul(c_cplx(0.0f, eTa_omega_scale * freq[i]), c_cplx(e, -negOmega))));
         cplx P4 = c_sub(
             c_mul(c_cplx(e1eTa, 0.0f),
                   c_sub(c_cplx(1.0f, 0.0f),
@@ -310,4 +413,34 @@ FP_TYPE *lmix_lfmodel_spectrum(
             dst_phase[i] = c_arg(G);
     }
     return dst_magn;
+}
+
+/* Generate one LF period, zero-padded to n samples. */
+FP_TYPE *lmix_lfmodel_period(lfmodel model, int fs, int n)
+{
+    lmix_lfparam p = lmix_lfparam_from_model(model);
+    FP_TYPE e = p.e;
+    FP_TYPE a = p.a;
+    FP_TYPE wg = p.wg;
+    FP_TYPE E0 = p.E0;
+    FP_TYPE Te = p.Te;
+    FP_TYPE Ta = p.Ta;
+    FP_TYPE T0 = p.T0;
+    FP_TYPE fs_f = fs;
+    int ne = (int)round(Te * fs_f);
+    int nT = (int)round(T0 * fs_f);
+    FP_TYPE *y = calloc((size_t)n, sizeof(FP_TYPE));
+    int i;
+    int end = ne < n ? ne : n;
+    for (i = 0; i < end; ++i) {
+        FP_TYPE t = (FP_TYPE)i / fs_f;
+        y[i] = E0 * exp_2(a * t) * sin_2(wg * t);
+    }
+    end = nT < n ? nT : n;
+    for (; i < end; ++i) {
+        FP_TYPE t = (FP_TYPE)i / fs_f;
+        y[i] = -model.Ee / e / Ta *
+            (exp_2(-e * (t - Te)) - exp_2(-e * (T0 - Te)));
+    }
+    return y;
 }

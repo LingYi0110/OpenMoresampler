@@ -18,8 +18,9 @@ typedef struct {
     FP_TYPE E0;
 } lmix_lfparam;
 
-lmix_lfparam lmix_lfparam_from_model(lfmodel model);
 FP_TYPE *lmix_lfmodel_spectrum(
     lfmodel model, FP_TYPE *freq, int nf, FP_TYPE *dst_phase);
+
+FP_TYPE *lmix_lfmodel_period(lfmodel model, int fs, int n);
 
 #endif
